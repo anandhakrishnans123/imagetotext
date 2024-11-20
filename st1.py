@@ -1,82 +1,102 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
-import pandas as pd
+from img2table.ocr import AzureOCR
+from img2table.document import Image
+import cv2
+from PIL import Image as PILImage
 import numpy as np
-from io import BytesIO
+import tempfile
+import time
 
-# Streamlit UI for synthetic data generation
-st.title("Synthetic Data Generator")
+# Azure OCR credentials (replace with your actual key and endpoint)
+subscription_key = "gMYpHRCnHqA8r2MxdtL203rBZ3WLTg4qFlH9wkxU40441ZLI302qJQQJ99AKACGhslBXJ3w3AAAFACOG50Ds"
+endpoint = "https://image-extration.cognitiveservices.azure.com/"
 
-# Upload the Excel file
-uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
+# Initialize AzureOCR
+azure_ocr = AzureOCR(subscription_key=subscription_key, endpoint=endpoint)
 
-if uploaded_file is not None:
-    # Load original data from uploaded file
-    original_data = pd.read_excel(uploaded_file)
-    st.success("File successfully loaded!")
-    st.write("Preview of Original Data:", original_data.head())
-    
-    # Input for the number of synthetic rows to generate
-    num_synthetic_rows = st.number_input("Number of synthetic rows to generate", min_value=1, step=1, value=10)
-    
-    if st.button("Generate Synthetic Data"):
-        # Initialize an empty dictionary to store synthetic data
-        synthetic_data = {}
-
-        # Generate synthetic data dynamically based on column types
-        for column in original_data.columns:
-            st.write(f"Processing column: {column}")
-            if pd.api.types.is_numeric_dtype(original_data[column]):  # For numeric columns
-                synthetic_data[column] = np.random.normal(
-                    loc=original_data[column].mean(),
-                    scale=original_data[column].std(),
-                    size=num_synthetic_rows
-                )
-            elif isinstance(original_data[column].dtype, pd.CategoricalDtype) or original_data[column].dtype == 'object':  # For categorical or string columns
-                unique_values = original_data[column].dropna().unique()
-                if len(unique_values) > 0:  # Check if there are valid unique values
-                    probabilities = original_data[column].dropna().value_counts(normalize=True).reindex(unique_values, fill_value=0).values
-                    synthetic_data[column] = np.random.choice(
-                        unique_values,
-                        size=num_synthetic_rows,
-                        p=probabilities
-                    )
-                else:
-                    synthetic_data[column] = [None] * num_synthetic_rows
-            elif pd.api.types.is_datetime64_any_dtype(original_data[column]):  # For datetime columns
-                if not original_data[column].isna().all():  # Check if the column has valid dates
-                    synthetic_data[column] = pd.to_datetime(
-                        np.random.choice(
-                            pd.date_range(
-                                start=original_data[column].min(),
-                                end=original_data[column].max()
-                            ),
-                            size=num_synthetic_rows
-                        )
-                    )
-                else:
-                    synthetic_data[column] = [None] * num_synthetic_rows
+# Retry logic for Azure OCR calls
+def extract_table_with_retry(image, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            return image.extract_tables(
+                ocr=azure_ocr,
+                implicit_rows=True,
+                borderless_tables=False,
+                min_confidence=30
+            )
+        except Exception as e:
+            if 'Too Many Requests' in str(e):
+                st.warning(f"Rate limit exceeded. Retrying in {delay} seconds... (Attempt {attempt + 1}/{retries})")
+                time.sleep(delay)
             else:
-                synthetic_data[column] = [None] * num_synthetic_rows  # Handle unsupported columns
+                raise e
+    raise Exception("Max retries exceeded for Azure OCR.")
 
-        # Convert the synthetic data dictionary to a DataFrame
-        synthetic_data_df = pd.DataFrame(synthetic_data)
-        st.write("Generated Synthetic Data Preview:", synthetic_data_df)
+# Streamlit app layout
+st.title("Azure OCR Table Extraction with Retry Logic")
+st.markdown("Upload an image to extract tables using Azure OCR. Handles rate limits gracefully.")
 
-        # Combine original and synthetic data
-        augmented_data = pd.concat([original_data, synthetic_data_df], ignore_index=True)
-        st.write("Augmented Data Preview:", augmented_data)
+# Upload image
+uploaded_file = st.file_uploader("Choose an image file", type=["png", "jpg", "jpeg"])
+if uploaded_file is not None:
+    # Display uploaded image
+    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+    cv_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    st.image(cv_img, caption="Uploaded Image", use_column_width=True)
 
-        # Save combined data to a single sheet Excel file
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            augmented_data.to_excel(writer, index=False, sheet_name="Augmented Data")
+    # Process the uploaded image
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        image_path = tmp_file.name
 
-        output.seek(0)
-        st.download_button(
-            label="Download Augmented Data",
-            data=output,
-            file_name="augmented_data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    img = Image(src=image_path)
+
+    # Extract tables using Azure OCR with retry logic
+    try:
+        extracted_tables = extract_table_with_retry(img, retries=3, delay=5)
+    except Exception as e:
+        st.error(f"Failed to extract tables: {e}")
+        extracted_tables = None
+
+    # Display results
+    if not extracted_tables:
+        st.warning("No tables were detected in the image.")
+        
+        # Optional: Debug OCR output
+        try:
+            ocr_output = img.extract_text(ocr=azure_ocr)
+            st.text("Raw OCR Output:")
+            st.write(ocr_output)
+        except Exception as e:
+            st.error(f"Failed to extract raw text: {e}")
+    else:
+        # Display and process extracted tables
+        for i, table in enumerate(extracted_tables):
+            st.markdown(f"### Table {i + 1}")
+            st.markdown(table.html_repr(title=f"Extracted Table {i + 1}"), unsafe_allow_html=True)
+
+            # Highlight table cells on the image
+            for row in table.content.values():
+                for cell in row:
+                    cv2.rectangle(cv_img, (cell.bbox.x1, cell.bbox.y1), (cell.bbox.x2, cell.bbox.y2), (255, 0, 0), 2)
+
+        # Display the image with highlighted table cells
+        st.image(cv_img, caption="Detected Table Cells", use_column_width=True)
+
+        # Allow users to download the tables as an Excel file
+        excel_path = "extracted_tables.xlsx"
+        img.to_xlsx(
+            excel_path,
+            ocr=azure_ocr,
+            implicit_rows=True,
+            borderless_tables=False,
+            min_confidence=50
         )
-
-        st.success(f"{num_synthetic_rows} synthetic rows added successfully!")
+        with open(excel_path, "rb") as excel_file:
+            st.download_button(
+                label="Download Extracted Tables as Excel",
+                data=excel_file,
+                file_name="extracted_tables.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
