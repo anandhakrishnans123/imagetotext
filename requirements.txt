@@ -1,4 +1,6 @@
 streamlit
-img2table[azure]
-opencv-contrib-python-headless
+img2table
+opencv-python
 Pillow
+numpy
+azure-ai-vision
